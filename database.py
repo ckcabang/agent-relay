@@ -1,9 +1,10 @@
-"""SQLite database setup and durable Agent Relay models.
+"""PostgreSQL database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module owns the engine, the models, the write-transaction helper, and
+lease recovery.  The rest of the application talks to the models through
+:mod:`storage`.  Concurrency comes from PostgreSQL row locks: claims use
+``FOR UPDATE SKIP LOCKED`` and every other state change locks the task row
+before its attempts, so all writers take locks in the same order.
 """
 
 from __future__ import annotations
@@ -11,15 +12,25 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Generator
+from typing import Generator
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+DEFAULT_DATABASE_URL = "postgresql+psycopg://agent_relay:agent_relay@127.0.0.1:5432/agent_relay"
+
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    url = os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
+    # Accept the common libpq-style scheme, but always use the psycopg 3 driver
+    # (SQLAlchemy's bare "postgresql://" would look for psycopg2).
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            url = "postgresql+psycopg://" + url[len(prefix) :]
+    if not url.startswith("postgresql+psycopg://"):
+        raise RuntimeError(f"RELAY_DATABASE_URL must be a PostgreSQL URL, got {url.split(':', 1)[0]!r}")
+    return url
 
 
 def positive_int(name: str, default: int) -> int:
@@ -44,7 +55,7 @@ def utcnow() -> datetime:
 
 
 def as_db_time(value: datetime) -> datetime:
-    """SQLite's DateTime implementation is most portable with naive UTC."""
+    """Columns are ``timestamp without time zone`` holding naive UTC."""
 
     return value.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -130,30 +141,8 @@ class Attempt(Base):
     task: Mapped[Task] = relationship("Task", back_populates="attempts")
 
 
-def _is_sqlite(url: str) -> bool:
-    return url.startswith("sqlite")
-
-
-engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
-if _is_sqlite(DATABASE_URL):
-    engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
-    if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
-        from sqlalchemy.pool import StaticPool
-
-        engine_kwargs["poolclass"] = StaticPool
-
-engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
-
-if _is_sqlite(DATABASE_URL):
-
-    @event.listens_for(engine, "connect")
-    def _sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.close()
-
+# connect_timeout makes an unreachable host fail fast instead of hanging.
+engine: Engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
@@ -164,6 +153,12 @@ def init_db() -> None:
 
 @contextmanager
 def db_session() -> Generator[Session, None, None]:
+    """One transaction: commit on success, roll back on error.
+
+    Writers that change task state lock rows explicitly with
+    ``SELECT ... FOR UPDATE`` inside this transaction.
+    """
+
     db = SessionLocal()
     try:
         yield db
@@ -175,67 +170,57 @@ def db_session() -> Generator[Session, None, None]:
         db.close()
 
 
-@contextmanager
-def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+def recover_expired_in_session(db: Session, now: datetime) -> int:
+    """Expire active leases and requeue/fail their tasks within ``db``.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    Locks each task row before its attempts (the same order as heartbeat and
+    terminal submission) and skips tasks another transaction holds; a later
+    pass picks those up if they are still expired.
     """
 
-    connection = engine.connect()
-    session = Session(bind=connection, expire_on_commit=False, autoflush=True)
-    try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
-        yield session
-        session.flush()
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        session.close()
-        connection.close()
-
-
-def recover_expired_in_session(db: Session, now: datetime) -> int:
-    """Expire active leases and requeue/fail their tasks within ``db``."""
-
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
+    task_ids = sorted(
+        set(
+            db.scalars(
+                select(Attempt.task_id).where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+            )
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for task_id in task_ids:
+        task = db.scalar(select(Task).where(Task.id == task_id).with_for_update(skip_locked=True))
+        if task is None:
             continue
-        attempt.outcome = "expired"
-        attempt.finished_at = now_db
-        if task.status == "processing":
-            if task.attempt_count >= MAX_ATTEMPTS:
-                task.status = "failed"
-                task.error = "attempts_exhausted"
-                task.output = None
-                task.finished_at = now_db
-            else:
-                task.status = "queued"
-                task.finished_at = None
-        count += 1
+        expired = db.scalars(
+            select(Attempt)
+            .where(
+                Attempt.task_id == task_id,
+                Attempt.outcome == "processing",
+                Attempt.lease_expires_at <= now_db,
+            )
+            .order_by(Attempt.attempt_number)
+            .with_for_update()
+        )
+        for attempt in expired:
+            attempt.outcome = "expired"
+            attempt.finished_at = now_db
+            if task.status == "processing":
+                if task.attempt_count >= MAX_ATTEMPTS:
+                    task.status = "failed"
+                    task.error = "attempts_exhausted"
+                    task.output = None
+                    task.finished_at = now_db
+                else:
+                    task.status = "queued"
+                    task.finished_at = None
+            count += 1
     return count
 
 
 def recover_expired() -> int:
     """Run one recovery pass and return the number of expired attempts."""
 
-    with immediate_transaction() as db:
+    with db_session() as db:
         return recover_expired_in_session(db, utcnow())
 
 
@@ -244,6 +229,7 @@ __all__ = [
     "Attempt",
     "Base",
     "DATABASE_URL",
+    "DEFAULT_DATABASE_URL",
     "DEFAULT_PAGE_SIZE",
     "LEASE_SECONDS",
     "MAX_ATTEMPTS",
@@ -255,7 +241,6 @@ __all__ = [
     "db_session",
     "db_time",
     "engine",
-    "immediate_transaction",
     "init_db",
     "iso_time",
     "recover_expired",

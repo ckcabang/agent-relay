@@ -1,20 +1,35 @@
-# Agent Relay (SQLite starter)
+# Agent Relay
 
 Agent Relay is a small FastAPI service for registering agents, delivering one
-task at a time, and recording results. The local starter is self-contained:
-SQLite persists the queue and attempts, while workers execute tasks on their own
-machines. The included worker deterministically returns `input.upper()`.
+task at a time, and recording results. PostgreSQL persists the queue and
+attempts, while workers execute tasks on their own machines. The included
+worker deterministically returns `input.upper()`.
 
 ## Run it
 
+With Docker, `compose.yaml` runs the relay and its `postgres` database:
+
+```bash
+docker compose up -d --build
+```
+
+Both ports are published on `127.0.0.1` only: the API on 8000 and PostgreSQL
+on 5432 (so the tests can reach it). Data lives in the `postgres-data` volume.
+Set `POSTGRES_PASSWORD` and `RELAY_ENROLLMENT_SECRET` (for example in a `.env`
+file) for anything beyond local use.
+
+To run the API on the host instead, start only the database:
+
 ```bash
 uv sync
+docker compose up -d postgres
 uv run uvicorn main:app --reload
 ```
 
 Open <http://127.0.0.1:8000/> for the token-based local dashboard. The default
-database is `./agent-relay.db`; set `RELAY_DATABASE_URL` to use another SQLite
-file. `GET /health` is a liveness check and `GET /ready` verifies database
+database is `postgresql+psycopg://agent_relay:agent_relay@127.0.0.1:5432/agent_relay`;
+set `RELAY_DATABASE_URL` to use another PostgreSQL database (`postgresql://`
+URLs are accepted and use the psycopg 3 driver). `GET /health` is a liveness check and `GET /ready` verifies database
 connectivity and schema (it queries the real tables, so a wiped volume
 reports not-ready instead of passing with zero tables).
 
@@ -67,13 +82,15 @@ uv run python main.py worker --agent-id agent_123 --token agt_… --worker-id la
 
 ## Storage and delivery behavior
 
-`database.py` contains SQLAlchemy models, SQLite WAL setup, and the isolated
-`BEGIN IMMEDIATE` transaction helper. `storage.py` contains task/claim/recovery
-operations; routes and request models are kept in `main.py` and `schemas.py`.
-SQLite does not provide PostgreSQL's `FOR UPDATE SKIP LOCKED`, so the starter
-serializes writer transactions to make concurrent claims safe across processes.
-Students can port this storage seam to PostgreSQL later without changing the
-HTTP protocol or lifecycle in `SPEC.md`.
+`database.py` contains the engine, SQLAlchemy models, and lease recovery.
+`storage.py` contains task/claim/recovery operations; routes and request models
+are kept in `main.py` and `schemas.py`. Claims select the oldest queued task
+with `FOR UPDATE SKIP LOCKED`, so concurrent workers in any number of API
+processes take different tasks without blocking each other. Heartbeat, terminal
+submission, and recovery lock the task row before its attempts, so every writer
+takes locks in the same order. Concurrent task creation with the same
+`Idempotency-Key` is resolved by the `(sender_id, idempotency_key)` unique
+constraint.
 
 Claims are at-least-once and leased for 60 seconds by default. Heartbeats extend
 an active lease. A completion or failure must include the recipient's bearer
@@ -91,12 +108,24 @@ asset serving:
 uv run pytest -q
 ```
 
-Tests default to a scratch database at `<system temp dir>/agent-relay-test.db` so they
-don't reset your dev server's `./agent-relay.db`. The fixture drops and
-recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
-the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
-running tests against another database.
+Tests need PostgreSQL (`docker compose up -d postgres`). They always use a
+separate database, `RELAY_TEST_DATABASE_URL` (default `agent_relay_test` on
+`127.0.0.1:5432`), create it if missing, and refuse any database whose name
+does not end in `_test`, because the fixtures drop and recreate all tables.
+Your `RELAY_DATABASE_URL` is ignored during tests.
 
-This starter intentionally does not include Docker, Kubernetes, CI, external
-brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
-student-port concerns rather than part of the local relay protocol.
+`test_integration_api.py` runs acceptance scenario 1 over HTTP against a real
+uvicorn process and checks the rows in PostgreSQL. To run it against the
+compose stack instead (it leaves its test agents and task in that database):
+
+```bash
+RELAY_TEST_BASE_URL=http://127.0.0.1:8000 \
+RELAY_TEST_TARGET_DATABASE_URL=postgresql://agent_relay:agent_relay@127.0.0.1:5432/agent_relay \
+  uv run pytest test_integration_api.py
+```
+
+Use `127.0.0.1` rather than `localhost` for the database host: on some systems
+`localhost` resolves to IPv6 `::1` first, which Docker does not publish here.
+
+This starter intentionally does not include Kubernetes, CI, external brokers,
+or an LLM.
