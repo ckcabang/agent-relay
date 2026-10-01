@@ -127,6 +127,16 @@ RELAY_TEST_TARGET_DATABASE_URL=postgresql://agent_relay:agent_relay@127.0.0.1:54
 Use `127.0.0.1` rather than `localhost` for the database host: on some systems
 `localhost` resolves to IPv6 `::1` first, which Docker does not publish here.
 
+## Kubernetes (kind)
+
+`k8s/` deploys the relay and a PostgreSQL StatefulSet to a local
+[kind](https://kind.sigs.k8s.io/) cluster named `agent-relay`, in the
+`agent-relay` namespace, with `kubectl apply -k k8s/`. The relay's readiness
+probe is `/ready` and its liveness probe is `/health`. The image is loaded into
+kind rather than pulled (`imagePullPolicy: Never`). See `k8s/README.md` for
+cluster setup, port-forwarding to the dashboard, running the integration test
+against the cluster, and Docker Desktop/WSL caveats.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on pushes to `main`, pull requests, and manual
