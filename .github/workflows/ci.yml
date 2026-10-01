@@ -1,0 +1,145 @@
+# Test against PostgreSQL, then build a uniquely tagged image and roll it out
+# to the local kind cluster (k8s/). Deploy runs only after the tests pass.
+#
+# Run it locally with act (settings in .actrc; see "CI" in README.md):
+#   act push
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KIND_CLUSTER: agent-relay
+  KIND_VERSION: v0.33.0
+  KUBECTL_VERSION: v1.37.0
+  NAMESPACE: agent-relay
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      UV_LINK_MODE: copy
+      RELAY_TEST_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@127.0.0.1:55432/agent_relay_test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay
+          POSTGRES_DB: agent_relay
+        # The job reaches it on 127.0.0.1 both on GitHub runners and under act
+        # (whose job container uses the host network). 55432 avoids clashing
+        # with a local `docker compose` database on 5432.
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # setup-uv publishes no floating major tag, so pin the release.
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # test_integration_api.py starts a real uvicorn process against the same
+      # database and checks the persisted rows.
+      - name: Run unit and API integration tests
+        run: uv run pytest -v
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency: deploy-kind
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install kind and kubectl
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/bin"
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-amd64"
+          echo "$(curl -fsSL "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-amd64.sha256sum" | cut -d' ' -f1)  kind" | sha256sum -c -
+          curl -fsSLo kubectl "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+          echo "$(curl -fsSL "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl.sha256")  kubectl" | sha256sum -c -
+          chmod +x kind kubectl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Check Docker access
+        run: docker version
+
+      # Commit plus UTC timestamp: unique per run, even when act runs the same
+      # commit (or an uncommitted working tree) more than once.
+      - name: Choose image tag
+        run: |
+          tag="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::12}"
+          echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "IMAGE=agent-relay:$tag" >> "$GITHUB_ENV"
+          echo "Image: agent-relay:$tag"
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      # GitHub-hosted runners start without a cluster; locally the existing
+      # one is reused.
+      - name: Ensure kind cluster exists
+        run: |
+          if ! kind get clusters | grep -qx "$KIND_CLUSTER"; then
+            kind create cluster --config k8s/kind-cluster.yaml --wait 120s
+          fi
+
+      # A private kubeconfig for this run. Under act the job container uses the
+      # host network (act's default), so kind's 127.0.0.1 API address works.
+      - name: Configure cluster access
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          kind get kubeconfig --name "$KIND_CLUSTER" > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          kubectl cluster-info
+
+      # The Deployment uses imagePullPolicy: Never, so the node must have it.
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE" --name "$KIND_CLUSTER"
+
+      - name: Deploy
+        run: |
+          mkdir -p .deploy
+          cat > .deploy/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - ../k8s
+          images:
+            - name: agent-relay
+              newTag: "$IMAGE_TAG"
+          EOF
+          kubectl apply -k .deploy
+          kubectl -n "$NAMESPACE" annotate deployment/agent-relay --overwrite \
+            kubernetes.io/change-cause="CI ${GITHUB_SHA::12}: $IMAGE"
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=180s
+          kubectl -n "$NAMESPACE" rollout status deployment/agent-relay --timeout=180s
+          deployed="$(kubectl -n "$NAMESPACE" get deployment/agent-relay -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          test "$deployed" = "$IMAGE" || { echo "expected $IMAGE, deployment has $deployed"; exit 1; }
+          kubectl -n "$NAMESPACE" get pods -o wide
+
+      - name: Show diagnostics
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" get all -o wide || true
+          kubectl -n "$NAMESPACE" describe pods || true
+          kubectl -n "$NAMESPACE" logs deployment/agent-relay --all-containers --tail=100 || true

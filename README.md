@@ -127,5 +127,32 @@ RELAY_TEST_TARGET_DATABASE_URL=postgresql://agent_relay:agent_relay@127.0.0.1:54
 Use `127.0.0.1` rather than `localhost` for the database host: on some systems
 `localhost` resolves to IPv6 `::1` first, which Docker does not publish here.
 
-This starter intentionally does not include Kubernetes, CI, external brokers,
-or an LLM.
+## CI
+
+`.github/workflows/ci.yml` runs on pushes to `main`, pull requests, and manual
+dispatch:
+
+1. **test** starts a `postgres:17-alpine` service (published on host port
+   55432) and runs `uv run pytest`, including the API integration test.
+2. **deploy** runs only if `test` passed (and not for pull requests). It builds
+   `agent-relay:<UTC timestamp>-<commit>`, loads it into the `agent-relay` kind
+   cluster (creating the cluster if it does not exist), applies `k8s/` with
+   that image tag, and waits for `rollout status`.
+
+Run it locally with [act](https://nektosact.com/) (`winget install nektos.act`)
+against Docker Desktop and the kind cluster from `k8s/README.md`:
+
+```bash
+act push
+```
+
+`.actrc` selects the `catthehacker/ubuntu:act-latest` runner image and mounts
+the Docker socket into the job containers. They build and `kind load` through
+the host's Docker engine and use act's default host network, so the
+kubeconfig from `kind get kubeconfig` (API on `127.0.0.1`) works unchanged.
+act copies the working tree, so uncommitted changes are tested and deployed
+too. Each run loads another image onto the kind node; list them with
+`docker exec agent-relay-control-plane crictl images | grep agent-relay` and
+remove old ones with `crictl rmi`.
+
+This starter intentionally does not include external brokers or an LLM.

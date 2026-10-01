@@ -26,6 +26,8 @@ kubectl --context kind-agent-relay -n agent-relay rollout status deployment/agen
 
 The image uses `imagePullPolicy: Never`, so after rebuilding it, load it again
 and run `kubectl -n agent-relay rollout restart deployment/agent-relay`.
+The CI workflow (`act push`, see the main README) does this with a unique image
+tag per run instead of `:local`.
 
 ## Dashboard and integration test
 
