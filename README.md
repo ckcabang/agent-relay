@@ -91,7 +91,7 @@ asset serving:
 uv run pytest -q
 ```
 
-Tests default to a scratch database at `/tmp/agent-relay-test.db` so they
+Tests default to a scratch database at `<system temp dir>/agent-relay-test.db` so they
 don't reset your dev server's `./agent-relay.db`. The fixture drops and
 recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
