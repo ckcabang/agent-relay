@@ -1,0 +1,28 @@
+# Agent Relay + PostgreSQL on a local kind cluster. See k8s/README.md.
+#   kubectl apply -k k8s/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agent-relay
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - agent-relay.yaml
+
+# Local-only defaults matching compose.yaml. Change these (or replace the
+# generator with an externally managed Secret) for anything beyond local use.
+secretGenerator:
+  - name: agent-relay-db
+    literals:
+      - POSTGRES_USER=agent_relay
+      - POSTGRES_PASSWORD=agent_relay
+      - POSTGRES_DB=agent_relay
+      - RELAY_DATABASE_URL=postgresql+psycopg://agent_relay:agent_relay@postgres:5432/agent_relay
+  - name: agent-relay-enrollment
+    literals:
+      - RELAY_ENROLLMENT_SECRET=
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: agent-relay

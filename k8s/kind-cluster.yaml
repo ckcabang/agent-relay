@@ -1,0 +1,14 @@
+# Single-node local cluster:
+#   kind create cluster --config k8s/kind-cluster.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: agent-relay
+nodes:
+  - role: control-plane
+    # Docker Desktop on WSL 2 can still run cgroup v1, which kubelet >= 1.35
+    # refuses by default ("kubelet is configured to not run on a host using
+    # cgroup v1"). Allow it; this is a no-op on cgroup v2 hosts.
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        failCgroupV1: false
